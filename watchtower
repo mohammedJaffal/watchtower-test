@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+
+PROGRAM_NAME="watchtower"
+VERSION="1.0"
+
+DEFAULT_LOG_DIR="/var/log/watchtower"
+LOG_DIR="$DEFAULT_LOG_DIR"
+LOG_FILE="$LOG_DIR/history.log"
+
+CONFIG_FILE=""
+MODE="subshell"
+INTERVAL=5
+CPU_THRESHOLD=80
+RAM_THRESHOLD=85
+DISK_THRESHOLD=90
+BACKUP_ONLY=false
+RESET_ONLY=false
+
+SSH_KEY="${WATCHTOWER_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
+
+declare -a SERVER_ALIAS=()
+declare -a SERVER_HOST=()
+declare -a SERVER_USER=()
+declare -a SERVER_PORT=()
+declare -a SERVER_OS=()
+declare -a SERVER_SERVICES=()
+declare -a METRICS=()
+
+show_help() {
+    cat <<EOF
+NAME
+    watchtower - Multi-Server Remote Health Monitor
+
+SYNOPSIS
+    ./watchtower [options] -c servers.conf
+
+DESCRIPTION
+    WatchTower monitors Linux servers, Docker test servers, and Windows servers
+    from one terminal. It reads a config file, collects CPU/RAM/disk/service
+    metrics, displays a live dashboard, and writes events to history.log.
+
+CONFIG FORMAT
+    alias host user port os_type services
+
+    Docker test server:
+        server1 localhost test 2221 linux ssh
+
+    Windows server example:
+        server5 192.168.X.X windows_user 22 windows sshd
+
+OPTIONS
+    -h              Show this help
+    -c <file>       Required config file for monitoring
+    -s              Subshell mode: sequential collection inside ( ... )
+    -f              Fork mode: one child process per server, using & and wait
+    -t              Thread mode: calls a small C pthread helper, then Bash workers
+    -l <dir>        Log directory, default /var/log/watchtower
+    -r              Restore/reset logs and cache, admin only
+    -b              Backup/compress history.log as tar.gz
+    -i <seconds>    Refresh interval, default 5
+    -a <values>     Thresholds, example: cpu=80,ram=85,disk=90
+    -v              Show version
+
+LOG FORMAT
+    yyyy-mm-dd-hh-mm-ss : username : INFOS : message
+    yyyy-mm-dd-hh-mm-ss : username : ERROR : message
+
+ERROR CODES
+    100 unknown option
+    101 missing mandatory config
+    102 config file not found
+    103 invalid config format
+    104 SSH failure
+    105 Docker failure
+    106 permission/admin error
+    107 dependency missing
+
+EXAMPLES
+    ./watchtower -s -c servers.conf
+    ./watchtower -t -i 2 -l ./logs -c servers.conf
+    ./watchtower -f -a cpu=70,ram=80,disk=85 -c servers.conf
+    ./watchtower -b -l ./logs -c servers.conf
+EOF
+}
+
+setup_logging() {
+    local used_fallback=false
+    if ! mkdir -p "$LOG_DIR" 2>/dev/null || [[ ! -w "$LOG_DIR" ]]; then
+        LOG_DIR="./logs"
+        LOG_FILE="$LOG_DIR/history.log"
+        mkdir -p "$LOG_DIR" 2>/dev/null || {
+            echo "Cannot create ./logs" >&2
+            exit 106
+        }
+        used_fallback=true
+    fi
+    touch "$LOG_FILE" 2>/dev/null || {
+        echo "Cannot write to $LOG_FILE" >&2
+        exit 106
+    }
+    if "$used_fallback"; then
+        log_info "Using ./logs because /var/log/watchtower is not writable"
+    fi
+}
+
+log_line() {
+    local type="$1"
+    local message="$2"
+    local timestamp username entry
+    timestamp=$(date +"%Y-%m-%d-%H-%M-%S")
+    username="${USER:-$(whoami)}"
+    entry="$timestamp : $username : $type : $message"
+
+    if [[ "$type" == "ERROR" ]]; then
+        echo "$entry" | tee -a "$LOG_FILE" >&2
+    else
+        echo "$entry" | tee -a "$LOG_FILE"
+    fi
+}
+
+log_info() {
+    log_line "INFOS" "$1"
+}
+
+log_error() {
+    log_line "ERROR" "$1"
+}
+
+write_history() {
+    local type="$1"
+    local message="$2"
+    local timestamp username
+    timestamp=$(date +"%Y-%m-%d-%H-%M-%S")
+    username="${USER:-$(whoami)}"
+    echo "$timestamp : $username : $type : $message" >> "$LOG_FILE"
+}
+
+die() {
+    local code="$1"
+    local message="$2"
+    setup_logging
+    log_error "Error $code: $message"
+    echo
+    show_help
+    exit "$code"
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || die 107 "Dependency missing: $1"
+}
+
+parse_thresholds() {
+    local item key value
+    IFS=',' read -ra items <<< "$1"
+    for item in "${items[@]}"; do
+        key="${item%%=*}"
+        value="${item#*=}"
+        [[ "$value" =~ ^[0-9]+$ ]] || die 103 "Invalid threshold: $item"
+        case "$key" in
+            cpu) CPU_THRESHOLD="$value" ;;
+            ram) RAM_THRESHOLD="$value" ;;
+            disk) DISK_THRESHOLD="$value" ;;
+            *) die 103 "Unknown threshold key: $key" ;;
+        esac
+    done
+}
+
+parse_args() {
+    while getopts ":hc:sftl:rbi:a:v" opt; do
+        case "$opt" in
+            h) show_help; exit 0 ;;
+            c) CONFIG_FILE="$OPTARG" ;;
+            s) MODE="subshell" ;;
+            f) MODE="fork" ;;
+            t) MODE="thread" ;;
+            l) LOG_DIR="$OPTARG"; LOG_FILE="$LOG_DIR/history.log" ;;
+            r) RESET_ONLY=true ;;
+            b) BACKUP_ONLY=true ;;
+            i)
+                [[ "$OPTARG" =~ ^[0-9]+$ && "$OPTARG" -ge 1 ]] || die 103 "Invalid interval: $OPTARG"
+                INTERVAL="$OPTARG"
+                ;;
+            a) parse_thresholds "$OPTARG" ;;
+            v) echo "$PROGRAM_NAME v$VERSION"; exit 0 ;;
+            :) die 101 "Option -$OPTARG needs a value" ;;
+            \?) die 100 "Unknown option: -$OPTARG" ;;
+        esac
+    done
+}
+
+reset_watchtower() {
+    [[ "$EUID" -eq 0 ]] || die 106 "-r requires administrator/root privileges"
+    rm -rf "$LOG_DIR/cache" "$LOG_DIR/baselines"
+    : > "$LOG_FILE"
+    log_info "Restore completed: logs, cache, and baselines reset."
+    exit 0
+}
+
+backup_logs() {
+    local timestamp archive
+    [[ -f "$LOG_FILE" ]] || die 102 "history.log not found in $LOG_DIR"
+    timestamp=$(date +"%Y-%m-%d-%H-%M-%S")
+    archive="$LOG_DIR/watchtower-logs-$timestamp.tar.gz"
+    tar -czf "$archive" -C "$LOG_DIR" history.log || die 107 "Could not create archive"
+    log_info "Backup created: $archive"
+    exit 0
+}
+
+parse_config() {
+    local line alias host user port os services lineno=0
+    [[ -n "$CONFIG_FILE" ]] || die 101 "Mandatory config file missing. Use -c servers.conf"
+    [[ -f "$CONFIG_FILE" ]] || die 102 "Config file not found: $CONFIG_FILE"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+        read -r alias host user port os services <<< "$line"
+
+        if [[ -z "$alias" || -z "$host" || -z "$user" || -z "$port" || -z "$os" ]]; then
+            die 103 "Invalid config line $lineno: $line"
+        fi
+        if [[ "$os" != "linux" && "$os" != "windows" ]]; then
+            die 103 "Invalid OS on line $lineno: $os"
+        fi
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            die 103 "Invalid port on line $lineno: $port"
+        fi
+
+        SERVER_ALIAS+=("$alias")
+        SERVER_HOST+=("$host")
+        SERVER_USER+=("$user")
+        SERVER_PORT+=("$port")
+        SERVER_OS+=("$os")
+        SERVER_SERVICES+=("${services:-ssh}")
+    done < "$CONFIG_FILE"
+
+    [[ "${#SERVER_ALIAS[@]}" -gt 0 ]] || die 103 "Config file contains no servers"
+    log_info "Config loaded: ${#SERVER_ALIAS[@]} server(s)"
+}
+
+ssh_run() {
+    local user="$1" host="$2" port="$3"
+    shift 3
+    local options=(-o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes -o LogLevel=ERROR)
+    [[ -f "$SSH_KEY" ]] && options+=(-i "$SSH_KEY")
+    ssh "${options[@]}" -p "$port" "$user@$host" "$@" 2>/dev/null
+}
+
+is_docker_target() {
+    local alias="$1"
+    command -v docker >/dev/null 2>&1 || return 1
+    docker inspect "$alias" >/dev/null 2>&1
+}
+
+ping_latency() {
+    local host="$1" line
+    line=$(ping -c 1 -W 2 "$host" 2>/dev/null | grep 'time=' | head -1)
+    if [[ "$line" =~ time=([0-9.]+) ]]; then
+        printf "%.0fms" "${BASH_REMATCH[1]}"
+    else
+        echo "N/A"
+    fi
+}
+
+service_summary() {
+    local services="$1"
+    local check_cmd="$2"
+    local total=0 up=0 down="" svc status
+    IFS=',' read -ra list <<< "$services"
+    total="${#list[@]}"
+    for svc in "${list[@]}"; do
+        status=$(eval "$check_cmd")
+        if [[ "$status" == "up" ]]; then
+            up=$((up + 1))
+        else
+            down+="${svc},"
+        fi
+    done
+    echo "$up|$total|${down%,}"
+}
+
+collect_docker() {
+    local alias="$1" services="$2"
+    local stats cpu ram disk load uptime latency failed svc_data
+
+    need_command docker
+    stats=$(docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemPerc}}' "$alias" 2>/dev/null) || {
+        echo "ERR|ERR|ERR|ERR|ERR|$alias|N/A|0|N/A|0|0||DOCKER_FAILED"
+        return
+    }
+    [[ -n "$stats" ]] || {
+        echo "ERR|ERR|ERR|ERR|ERR|$alias|N/A|0|N/A|0|0||DOCKER_FAILED"
+        return
+    }
+
+    cpu=$(awk '{gsub("%","",$2); printf "%d", $2 + 0}' <<< "$stats")
+    ram=$(awk '{gsub("%","",$3); printf "%d", $3 + 0}' <<< "$stats")
+    disk=$(docker exec "$alias" bash -lc "df / | awk 'NR==2 {gsub(\"%\", \"\", \$5); print \$5}'" 2>/dev/null || echo "ERR")
+    load="N/A"
+    uptime=$(docker inspect -f '{{.State.StartedAt}}' "$alias" 2>/dev/null | cut -d'.' -f1)
+    latency="local"
+    failed=0
+
+    svc_data=$(service_summary "$services" "docker exec '$alias' bash -lc 'pgrep -x \"\$svc\" >/dev/null || service \"\$svc\" status >/dev/null 2>&1' && echo up || echo down")
+    echo "$cpu|$ram|$disk|$load|$uptime|$alias|$latency|$failed|N/A|$svc_data|"
+}
+
+collect_linux_ssh() {
+    local alias="$1" host="$2" user="$3" port="$4" services="$5"
+    local result latency svc_data
+
+    latency=$(ping_latency "$host")
+    result=$(ssh_run "$user" "$host" "$port" 'bash -s' <<'REMOTE'
+read cpu1 idle1 < <(awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8, $5}' /proc/stat)
+sleep 1
+read cpu2 idle2 < <(awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8, $5}' /proc/stat)
+cpu=$(( (cpu2-cpu1-(idle2-idle1))*100/(cpu2-cpu1+1) ))
+ram=$(free | awk '/^Mem:/ {printf "%d", $3/$2*100}')
+disk=$(df / | awk 'NR==2 {gsub("%","",$5); print $5}')
+load=$(awk '{print $1}' /proc/loadavg)
+uptime_value=$(uptime -p 2>/dev/null | sed 's/up //' || echo N/A)
+hostname_value=$(hostname)
+last_login=$(last -n 1 2>/dev/null | head -1 | awk '{print $1" "$4" "$5" "$6" "$7}' || echo N/A)
+failed=$(grep -hi 'Failed password' /var/log/auth.log /var/log/secure 2>/dev/null | wc -l | awk '{print $1}')
+echo "$cpu|$ram|$disk|$load|$uptime_value|$hostname_value|$failed|$last_login"
+REMOTE
+)
+    [[ -n "$result" ]] || {
+        echo "ERR|ERR|ERR|ERR|ERR|$alias|$latency|0|N/A|0|0||SSH_FAILED"
+        return
+    }
+
+    svc_data=$(service_summary "$services" "ssh_run '$user' '$host' '$port' \"systemctl is-active '\$svc' 2>/dev/null || service '\$svc' status >/dev/null 2>&1 && echo active\" | grep -q active && echo up || echo down")
+    IFS='|' read -r cpu ram disk load uptime_value hostname_value failed last_login <<< "$result"
+    echo "$cpu|$ram|$disk|$load|$uptime_value|$hostname_value|$latency|$failed|$last_login|$svc_data|"
+}
+
+ps_encoded() {
+    printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n'
+}
+
+collect_windows() {
+    local alias="$1" host="$2" user="$3" port="$4" services="$5"
+    local latency script encoded result svc_data
+
+    latency=$(ping_latency "$host")
+    script='$cpu=(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='\''_Total'\''").PercentProcessorTime; $os=Get-CimInstance Win32_OperatingSystem; $ram=[math]::Round((($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/$os.TotalVisibleMemorySize)*100,2); $d=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='\''C:'\''"; $disk=[math]::Round((($d.Size-$d.FreeSpace)/$d.Size)*100,2); $up=(Get-Date)-$os.LastBootUpTime; $hn=$env:COMPUTERNAME; Write-Output "$cpu|$ram|$disk|N/A|$($up.Days)d $($up.Hours)h|$hn"'
+    encoded=$(ps_encoded "$script")
+    result=$(ssh_run "$user" "$host" "$port" "powershell -NoProfile -EncodedCommand $encoded" | tr -d '\r')
+    [[ -n "$result" ]] || {
+        echo "ERR|ERR|ERR|ERR|ERR|$alias|$latency|0|N/A|0|0||SSH_FAILED"
+        return
+    }
+
+    svc_data=$(service_summary "$services" "script=\"\\\$s=Get-Service -Name '\$svc' -ErrorAction SilentlyContinue; if (\\\$s -and \\\$s.Status -eq 'Running') { 'up' } else { 'down' }\"; encoded=\$(ps_encoded \"\$script\"); ssh_run '$user' '$host' '$port' \"powershell -NoProfile -EncodedCommand \$encoded\" | tr -d '\r'")
+    IFS='|' read -r cpu ram disk load uptime_value hostname_value <<< "$result"
+    echo "$cpu|$ram|$disk|$load|$uptime_value|$hostname_value|$latency|0|N/A|$svc_data|"
+}
+
+collect_one() {
+    local i="$1"
+    local alias="${SERVER_ALIAS[$i]}"
+    local host="${SERVER_HOST[$i]}"
+    local user="${SERVER_USER[$i]}"
+    local port="${SERVER_PORT[$i]}"
+    local os="${SERVER_OS[$i]}"
+    local services="${SERVER_SERVICES[$i]}"
+
+    if is_docker_target "$alias"; then
+        collect_docker "$alias" "$services"
+    elif [[ "$os" == "windows" ]]; then
+        collect_windows "$alias" "$host" "$user" "$port" "$services"
+    else
+        collect_linux_ssh "$alias" "$host" "$user" "$port" "$services"
+    fi
+}
+
+store_metric_file() {
+    local file="$1" index="$2"
+    collect_one "$index" > "$file"
+}
+
+collect_subshell() {
+    local i
+    for i in "${!SERVER_ALIAS[@]}"; do
+        METRICS[$i]="$( ( collect_one "$i" ) )"
+    done
+    log_info "Subshell mode completed"
+}
+
+collect_fork() {
+    local tmpdir i pid
+    tmpdir=$(mktemp -d)
+    for i in "${!SERVER_ALIAS[@]}"; do
+        store_metric_file "$tmpdir/$i.out" "$i" &
+    done
+    wait
+    for i in "${!SERVER_ALIAS[@]}"; do
+        METRICS[$i]="$(cat "$tmpdir/$i.out" 2>/dev/null)"
+    done
+    rm -rf "$tmpdir"
+    log_info "Fork mode completed with ${#SERVER_ALIAS[@]} child processes"
+}
+
+ensure_thread_helper() {
+    local helper="./watchtower_threads"
+    [[ -x "$helper" ]] && return 0
+    [[ -f "./watchtower_threads.c" ]] || die 107 "watchtower_threads.c missing"
+    if command -v cc >/dev/null 2>&1; then
+        cc -pthread -o "$helper" ./watchtower_threads.c || die 107 "Could not compile pthread helper"
+    elif command -v gcc >/dev/null 2>&1; then
+        gcc -pthread -o "$helper" ./watchtower_threads.c || die 107 "Could not compile pthread helper"
+    else
+        die 107 "C compiler missing for pthread helper"
+    fi
+}
+
+collect_thread() {
+    local line
+    ensure_thread_helper
+    while IFS= read -r line; do
+        write_history "INFOS" "$line"
+    done < <(./watchtower_threads "${#SERVER_ALIAS[@]}" 2>&1)
+    collect_fork
+    log_info "Thread mode used pthread helper and Bash workers"
+}
+
+collect_all() {
+    case "$MODE" in
+        subshell) collect_subshell ;;
+        fork) collect_fork ;;
+        thread) collect_thread ;;
+    esac
+}
+
+status_for() {
+    local cpu="$1" ram="$2" disk="$3" svc_up="$4" svc_total="$5" error="$6"
+    if [[ "$error" == "SSH_FAILED" || "$error" == "DOCKER_FAILED" ]]; then
+        echo "DOWN"
+    elif [[ "$cpu" =~ ^[0-9]+([.][0-9]+)?$ && "${cpu%.*}" -ge "$CPU_THRESHOLD" ]]; then
+        echo "CRITICAL"
+    elif [[ "$ram" =~ ^[0-9]+([.][0-9]+)?$ && "${ram%.*}" -ge "$RAM_THRESHOLD" ]]; then
+        echo "CRITICAL"
+    elif [[ "$disk" =~ ^[0-9]+([.][0-9]+)?$ && "${disk%.*}" -ge "$DISK_THRESHOLD" ]]; then
+        echo "CRITICAL"
+    elif [[ "$svc_up" =~ ^[0-9]+$ && "$svc_total" =~ ^[0-9]+$ && "$svc_up" -lt "$svc_total" ]]; then
+        echo "WARNING"
+    else
+        echo "HEALTHY"
+    fi
+}
+
+draw_dashboard() {
+    local now i row cpu ram disk load up host latency failed last_login svc_up svc_total svc_down error status color svc cpu_show ram_show disk_show
+    local alerts=()
+    now=$(date +"%Y-%m-%d %H:%M:%S")
+    clear
+    echo "+--------------+---------+-------+-------+-------+--------+------+----------+--------------+"
+    printf "| %-86s |\n" "WATCHTOWER v$VERSION - Live Multi-Server Monitor [$now]"
+    echo "+--------------+---------+-------+-------+-------+--------+------+----------+--------------+"
+    echo "| Server       | OS      | CPU   | RAM   | DISK  | PING   | FAIL | SVC      | Status       |"
+    echo "+--------------+---------+-------+-------+-------+--------+------+----------+--------------+"
+
+    for i in "${!SERVER_ALIAS[@]}"; do
+        row="${METRICS[$i]}"
+        IFS='|' read -r cpu ram disk load up host latency failed last_login svc_up svc_total svc_down error <<< "$row"
+        status=$(status_for "$cpu" "$ram" "$disk" "$svc_up" "$svc_total" "$error")
+        color="$GREEN"
+        [[ "$status" == "WARNING" ]] && color="$YELLOW"
+        [[ "$status" == "CRITICAL" || "$status" == "DOWN" ]] && color="$RED"
+        svc="${svc_up}/${svc_total}"
+        [[ "$svc_total" == "0" ]] && svc="N/A"
+        cpu_show="$cpu"; ram_show="$ram"; disk_show="$disk"
+        [[ "$cpu_show" != "ERR" ]] && cpu_show="${cpu_show}%"
+        [[ "$ram_show" != "ERR" ]] && ram_show="${ram_show}%"
+        [[ "$disk_show" != "ERR" ]] && disk_show="${disk_show}%"
+        printf "| %-12s | %-7s | %-5s | %-5s | %-5s | %-6s | %-4s | %-8s | ${color}%-12s${RESET} |\n" \
+            "${SERVER_ALIAS[$i]}" "${SERVER_OS[$i]}" "$cpu_show" "$ram_show" "$disk_show" "$latency" "$failed" "$svc" "$status"
+
+        if [[ "$status" != "HEALTHY" ]]; then
+            alerts+=("${SERVER_ALIAS[$i]} status=$status cpu=$cpu ram=$ram disk=$disk services=$svc error=$error")
+            write_history "ERROR" "${SERVER_ALIAS[$i]} status=$status cpu=$cpu ram=$ram disk=$disk services=$svc error=$error"
+        fi
+    done
+    echo "+--------------+---------+-------+-------+-------+--------+------+----------+--------------+"
+    if [[ "${#alerts[@]}" -gt 0 ]]; then
+        echo
+        echo "ALERTS:"
+        for alert in "${alerts[@]}"; do
+            echo "  - $alert"
+        done
+    fi
+    echo "Mode: $MODE | Interval: ${INTERVAL}s | Log: $LOG_FILE | Ctrl+C to stop"
+    write_history "INFOS" "Dashboard refreshed"
+}
+
+cleanup() {
+    echo
+    log_info "WatchTower stopped"
+    exit 0
+}
+
+main() {
+    parse_args "$@"
+    setup_logging
+
+    if "$RESET_ONLY"; then
+        reset_watchtower
+    fi
+    if "$BACKUP_ONLY"; then
+        backup_logs
+    fi
+
+    parse_config
+    need_command awk
+    need_command ping
+    need_command ssh
+    need_command tar
+
+    log_info "WatchTower started in $MODE mode"
+    trap cleanup INT TERM
+
+    while true; do
+        collect_all
+        draw_dashboard
+        sleep "$INTERVAL"
+    done
+}
+
+main "$@"

@@ -1,0 +1,5 @@
+logs/
+servers.local.conf
+watchtower_threads
+*.tar.gz
+.DS_Store
