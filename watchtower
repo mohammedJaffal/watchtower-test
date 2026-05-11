@@ -31,6 +31,7 @@ declare -a SERVER_USER=()
 declare -a SERVER_PORT=()
 declare -a SERVER_OS=()
 declare -a SERVER_SERVICES=()
+declare -a SERVER_PASSWORD=()
 declare -a METRICS=()
 
 show_help() {
@@ -47,13 +48,16 @@ DESCRIPTION
     metrics, displays a live dashboard, and writes events to history.log.
 
 CONFIG FORMAT
-    alias host user port os_type services
+    alias host user port os_type services [password]
 
     Docker test server:
-        server1 localhost test 2221 linux ssh
+        server1 localhost test 2221 linux sshd
 
     Windows server example:
         server5 192.168.X.X windows_user 22 windows sshd
+
+    Password example:
+        server6 192.168.X.X windows_user 22 windows sshd MyPassword123
 
 OPTIONS
     -h              Show this help
@@ -214,14 +218,14 @@ backup_logs() {
 }
 
 parse_config() {
-    local line alias host user port os services lineno=0
+    local line alias host user port os services password lineno=0
     [[ -n "$CONFIG_FILE" ]] || die 101 "Mandatory config file missing. Use -c servers.conf"
     [[ -f "$CONFIG_FILE" ]] || die 102 "Config file not found: $CONFIG_FILE"
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         lineno=$((lineno + 1))
         [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
-        read -r alias host user port os services <<< "$line"
+        read -r alias host user port os services password <<< "$line"
 
         if [[ -z "$alias" || -z "$host" || -z "$user" || -z "$port" || -z "$os" ]]; then
             die 103 "Invalid config line $lineno: $line"
@@ -238,19 +242,38 @@ parse_config() {
         SERVER_USER+=("$user")
         SERVER_PORT+=("$port")
         SERVER_OS+=("$os")
-        SERVER_SERVICES+=("${services:-ssh}")
+        SERVER_SERVICES+=("${services:-sshd}")
+        SERVER_PASSWORD+=("${password:-}")
     done < "$CONFIG_FILE"
 
     [[ "${#SERVER_ALIAS[@]}" -gt 0 ]] || die 103 "Config file contains no servers"
     log_info "Config loaded: ${#SERVER_ALIAS[@]} server(s)"
 }
 
+need_sshpass_if_required() {
+    local password
+    for password in "${SERVER_PASSWORD[@]}"; do
+        if [[ -n "$password" ]]; then
+            need_command sshpass
+            return 0
+        fi
+    done
+}
+
 ssh_run() {
-    local user="$1" host="$2" port="$3"
-    shift 3
-    local options=(-o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes -o LogLevel=ERROR)
-    [[ -f "$SSH_KEY" ]] && options+=(-i "$SSH_KEY")
-    ssh "${options[@]}" -p "$port" "$user@$host" "$@" 2>/dev/null
+    local user="$1" host="$2" port="$3" password="$4"
+    shift 4
+    local options=(-o ConnectTimeout=5 -o StrictHostKeyChecking=no -o LogLevel=ERROR)
+
+    if [[ -n "$password" ]]; then
+        command -v sshpass >/dev/null 2>&1 || die 107 "Dependency missing: sshpass for password-based SSH"
+        options+=(-o BatchMode=no -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no)
+        sshpass -p "$password" ssh "${options[@]}" -p "$port" "$user@$host" "$@" 2>/dev/null
+    else
+        options+=(-o BatchMode=yes)
+        [[ -f "$SSH_KEY" ]] && options+=(-i "$SSH_KEY")
+        ssh "${options[@]}" -p "$port" "$user@$host" "$@" 2>/dev/null
+    fi
 }
 
 is_docker_target() {
@@ -323,11 +346,11 @@ collect_docker() {
 }
 
 collect_linux_ssh() {
-    local alias="$1" host="$2" user="$3" port="$4" services="$5"
+    local alias="$1" host="$2" user="$3" port="$4" services="$5" password="$6"
     local result latency svc_data
 
     latency=$(ping_latency "$host")
-    result=$(ssh_run "$user" "$host" "$port" 'bash -s' <<'REMOTE'
+    result=$(ssh_run "$user" "$host" "$port" "$password" 'bash -s' <<'REMOTE'
 read cpu1 idle1 < <(awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8, $5}' /proc/stat)
 sleep 1
 read cpu2 idle2 < <(awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8, $5}' /proc/stat)
@@ -347,7 +370,7 @@ REMOTE
         return
     }
 
-    svc_data=$(service_summary "$services" "ssh_run '$user' '$host' '$port' \"systemctl is-active '\$svc' 2>/dev/null || service '\$svc' status >/dev/null 2>&1 && echo active\" | grep -q active && echo up || echo down")
+    svc_data=$(service_summary "$services" "ssh_run '$user' '$host' '$port' '$password' \"systemctl is-active '\$svc' 2>/dev/null || service '\$svc' status >/dev/null 2>&1 && echo active\" | grep -q active && echo up || echo down")
     IFS='|' read -r cpu ram disk load uptime_value hostname_value failed last_login <<< "$result"
     echo "$cpu|$ram|$disk|$load|$uptime_value|$hostname_value|$latency|$failed|$last_login|$svc_data|"
 }
@@ -357,19 +380,19 @@ ps_encoded() {
 }
 
 collect_windows() {
-    local alias="$1" host="$2" user="$3" port="$4" services="$5"
+    local alias="$1" host="$2" user="$3" port="$4" services="$5" password="$6"
     local latency script encoded result svc_data
 
     latency=$(ping_latency "$host")
     script='$cpu=(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='\''_Total'\''").PercentProcessorTime; $os=Get-CimInstance Win32_OperatingSystem; $ram=[math]::Round((($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/$os.TotalVisibleMemorySize)*100,2); $d=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='\''C:'\''"; $disk=[math]::Round((($d.Size-$d.FreeSpace)/$d.Size)*100,2); $up=(Get-Date)-$os.LastBootUpTime; $hn=$env:COMPUTERNAME; Write-Output "$cpu|$ram|$disk|N/A|$($up.Days)d $($up.Hours)h|$hn"'
     encoded=$(ps_encoded "$script")
-    result=$(ssh_run "$user" "$host" "$port" "powershell -NoProfile -EncodedCommand $encoded" | tr -d '\r')
+    result=$(ssh_run "$user" "$host" "$port" "$password" "powershell -NoProfile -EncodedCommand $encoded" | tr -d '\r')
     [[ -n "$result" ]] || {
         echo "ERR|ERR|ERR|ERR|ERR|$alias|$latency|0|N/A|0|0||SSH_FAILED"
         return
     }
 
-    svc_data=$(service_summary "$services" "script=\"\\\$s=Get-Service -Name '\$svc' -ErrorAction SilentlyContinue; if (\\\$s -and \\\$s.Status -eq 'Running') { 'up' } else { 'down' }\"; encoded=\$(ps_encoded \"\$script\"); ssh_run '$user' '$host' '$port' \"powershell -NoProfile -EncodedCommand \$encoded\" | tr -d '\r'")
+    svc_data=$(service_summary "$services" "script=\"\\\$s=Get-Service -Name '\$svc' -ErrorAction SilentlyContinue; if (\\\$s -and \\\$s.Status -eq 'Running') { 'up' } else { 'down' }\"; encoded=\$(ps_encoded \"\$script\"); ssh_run '$user' '$host' '$port' '$password' \"powershell -NoProfile -EncodedCommand \$encoded\" | tr -d '\r'")
     IFS='|' read -r cpu ram disk load uptime_value hostname_value <<< "$result"
     echo "$cpu|$ram|$disk|$load|$uptime_value|$hostname_value|$latency|0|N/A|$svc_data|"
 }
@@ -382,13 +405,14 @@ collect_one() {
     local port="${SERVER_PORT[$i]}"
     local os="${SERVER_OS[$i]}"
     local services="${SERVER_SERVICES[$i]}"
+    local password="${SERVER_PASSWORD[$i]}"
 
     if is_docker_target "$alias"; then
         collect_docker "$alias" "$services"
     elif [[ "$os" == "windows" ]]; then
-        collect_windows "$alias" "$host" "$user" "$port" "$services"
+        collect_windows "$alias" "$host" "$user" "$port" "$services" "$password"
     else
-        collect_linux_ssh "$alias" "$host" "$user" "$port" "$services"
+        collect_linux_ssh "$alias" "$host" "$user" "$port" "$services" "$password"
     fi
 }
 
@@ -529,6 +553,7 @@ main() {
     fi
 
     parse_config
+    need_sshpass_if_required
     need_command awk
     need_command ping
     need_command ssh
