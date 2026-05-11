@@ -289,6 +289,7 @@ service_summary() {
 collect_docker() {
     local alias="$1" services="$2"
     local stats cpu ram disk load uptime latency failed svc_data
+    local svc total=0 up=0 down=""
 
     need_command docker
     stats=$(docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemPerc}}' "$alias" 2>/dev/null) || {
@@ -308,7 +309,16 @@ collect_docker() {
     latency="local"
     failed=0
 
-    svc_data=$(service_summary "$services" "docker exec '$alias' bash -lc 'pgrep -x \"\$svc\" >/dev/null || service \"\$svc\" status >/dev/null 2>&1' && echo up || echo down")
+    IFS=',' read -ra svc_list <<< "$services"
+    total="${#svc_list[@]}"
+    for svc in "${svc_list[@]}"; do
+        if docker exec "$alias" bash -lc "pgrep -x '$svc' >/dev/null || service '$svc' status >/dev/null 2>&1" 2>/dev/null; then
+            up=$((up + 1))
+        else
+            down+="${svc},"
+        fi
+    done
+    svc_data="$up|$total|${down%,}"
     echo "$cpu|$ram|$disk|$load|$uptime|$alias|$latency|$failed|N/A|$svc_data|"
 }
 
