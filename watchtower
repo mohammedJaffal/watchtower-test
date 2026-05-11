@@ -15,8 +15,11 @@ RAM_THRESHOLD=85
 DISK_THRESHOLD=90
 BACKUP_ONLY=false
 RESET_ONLY=false
+TELEGRAM_ALERTS=false
 
 SSH_KEY="${WATCHTOWER_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+TELEGRAM_BOT_TOKEN="${WATCHTOWER_TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT_ID="${WATCHTOWER_TELEGRAM_CHAT_ID:-}"
 
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
@@ -68,6 +71,7 @@ OPTIONS
     -l <dir>        Log directory, default /var/log/watchtower
     -r              Restore/reset logs and cache, admin only
     -b              Backup/compress history.log as tar.gz
+    -m              Enable Telegram alerts for CRITICAL and DOWN states
     -i <seconds>    Refresh interval, default 5
     -a <values>     Thresholds, example: cpu=80,ram=85,disk=90
     -v              Show version
@@ -91,6 +95,7 @@ EXAMPLES
     ./watchtower -t -i 2 -l ./logs -c servers.conf
     ./watchtower -f -a cpu=70,ram=80,disk=85 -c servers.conf
     ./watchtower -b -l ./logs -c servers.conf
+    ./watchtower -m -t -c servers.conf
 EOF
 }
 
@@ -177,7 +182,7 @@ parse_thresholds() {
 }
 
 parse_args() {
-    while getopts ":hc:sftl:rbi:a:v" opt; do
+    while getopts ":hc:sftl:rbmi:a:v" opt; do
         case "$opt" in
             h) show_help; exit 0 ;;
             c) CONFIG_FILE="$OPTARG" ;;
@@ -187,6 +192,7 @@ parse_args() {
             l) LOG_DIR="$OPTARG"; LOG_FILE="$LOG_DIR/history.log" ;;
             r) RESET_ONLY=true ;;
             b) BACKUP_ONLY=true ;;
+            m) TELEGRAM_ALERTS=true ;;
             i)
                 [[ "$OPTARG" =~ ^[0-9]+$ && "$OPTARG" -ge 1 ]] || die 103 "Invalid interval: $OPTARG"
                 INTERVAL="$OPTARG"
@@ -197,6 +203,15 @@ parse_args() {
             \?) die 100 "Unknown option: -$OPTARG" ;;
         esac
     done
+}
+
+load_local_env_files() {
+    if [[ -f "./telegram.local.env" ]]; then
+        # shellcheck disable=SC1091
+        . "./telegram.local.env"
+        TELEGRAM_BOT_TOKEN="${WATCHTOWER_TELEGRAM_TOKEN:-$TELEGRAM_BOT_TOKEN}"
+        TELEGRAM_CHAT_ID="${WATCHTOWER_TELEGRAM_CHAT_ID:-$TELEGRAM_CHAT_ID}"
+    fi
 }
 
 reset_watchtower() {
@@ -258,6 +273,53 @@ need_sshpass_if_required() {
             return 0
         fi
     done
+}
+
+need_telegram_if_required() {
+    if "$TELEGRAM_ALERTS"; then
+        need_command curl
+        [[ -n "$TELEGRAM_BOT_TOKEN" ]] || die 107 "WATCHTOWER_TELEGRAM_TOKEN is missing"
+        [[ -n "$TELEGRAM_CHAT_ID" ]] || die 107 "WATCHTOWER_TELEGRAM_CHAT_ID is missing"
+        mkdir -p "$LOG_DIR/cache" 2>/dev/null || die 106 "Cannot create $LOG_DIR/cache"
+    fi
+}
+
+send_telegram_message() {
+    local text="$1"
+    curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+        --data-urlencode "text=${text}" >/dev/null 2>&1 || \
+        write_history "ERROR" "Telegram alert delivery failed"
+}
+
+maybe_send_telegram_alert() {
+    local alias="$1" status="$2" cpu="$3" ram="$4" disk="$5" svc="$6" error="$7"
+    local state_file previous now message
+
+    "$TELEGRAM_ALERTS" || return 0
+    [[ "$status" == "CRITICAL" || "$status" == "DOWN" ]] || return 0
+
+    state_file="$LOG_DIR/cache/telegram_${alias}.state"
+    previous=""
+    [[ -f "$state_file" ]] && previous="$(cat "$state_file" 2>/dev/null)"
+    [[ "$previous" == "$status" ]] && return 0
+
+    now=$(date +"%Y-%m-%d %H:%M:%S")
+    message=$'WatchTower alert\n'
+    message+="Server: $alias"$'\n'
+    message+="Status: $status"$'\n'
+    message+="CPU: $cpu"$'\n'
+    message+="RAM: $ram"$'\n'
+    message+="DISK: $disk"$'\n'
+    message+="Services: $svc"$'\n'
+    if [[ -n "$error" ]]; then
+        message+="Error: $error"$'\n'
+    fi
+    message+="Time: $now"
+
+    send_telegram_message "$message"
+    printf "%s" "$status" > "$state_file"
+    write_history "INFOS" "Telegram alert sent for $alias ($status)"
 }
 
 ssh_run() {
@@ -521,6 +583,7 @@ draw_dashboard() {
         if [[ "$status" != "HEALTHY" ]]; then
             alerts+=("${SERVER_ALIAS[$i]} status=$status cpu=$cpu ram=$ram disk=$disk services=$svc error=$error")
             write_history "ERROR" "${SERVER_ALIAS[$i]} status=$status cpu=$cpu ram=$ram disk=$disk services=$svc error=$error"
+            maybe_send_telegram_alert "${SERVER_ALIAS[$i]}" "$status" "$cpu_show" "$ram_show" "$disk_show" "$svc" "$error"
         fi
     done
     echo "+--------------+---------+-------+-------+-------+--------+------+----------+--------------+"
@@ -544,6 +607,7 @@ cleanup() {
 main() {
     parse_args "$@"
     setup_logging
+    load_local_env_files
 
     if "$RESET_ONLY"; then
         reset_watchtower
@@ -554,6 +618,7 @@ main() {
 
     parse_config
     need_sshpass_if_required
+    need_telegram_if_required
     need_command awk
     need_command ping
     need_command ssh

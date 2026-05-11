@@ -1,5 +1,6 @@
 logs/
 servers.local.conf
+telegram.local.env
 watchtower_threads
 *.tar.gz
 .DS_Store
