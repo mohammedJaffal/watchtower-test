@@ -2,6 +2,11 @@
 
 set -e
 
+docker_ready() {
+    command -v docker >/dev/null 2>&1 || return 1
+    docker info >/dev/null 2>&1
+}
+
 find_bash() {
     local candidate
     for candidate in \
@@ -52,12 +57,18 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     exit 0
 fi
 
-if [[ -n "$KEY_FILE" ]]; then
-    WATCHTOWER_SSH_KEY="$KEY_FILE" ./setup-docker-keys.sh
-    echo "Using SSH key: $KEY_FILE"
+if docker_ready; then
+    if [[ -n "$KEY_FILE" ]]; then
+        WATCHTOWER_SSH_KEY="$KEY_FILE" ./setup-docker-keys.sh
+        echo "Using SSH key: $KEY_FILE"
+    else
+        echo "No SSH key found. Continuing without key-based auth."
+        echo "Any non-Docker servers must use the password column in $CONFIG_FILE."
+    fi
 else
-    echo "No SSH key found. Continuing without key-based auth."
-    echo "Any non-Docker servers must use the password column in $CONFIG_FILE."
+    echo "Docker is not running or not reachable."
+    echo "Start Docker Desktop, or remove Docker localhost entries from $CONFIG_FILE if you only want VM servers."
+    exit 1
 fi
 
 echo "Using Bash: $BASH_BIN"
